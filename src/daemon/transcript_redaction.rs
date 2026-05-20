@@ -6,29 +6,27 @@ fn is_denied_key(key: &str) -> bool {
     if key == "id" || key.ends_with("_id") || key.ends_with("Id") || key.ends_with("ID") {
         return true;
     }
-    let lower = key.to_ascii_lowercase();
-    if lower.ends_with("uuid") {
+    if key.eq_ignore_ascii_case("uuid")
+        || (key.len() > 4 && key[key.len() - 4..].eq_ignore_ascii_case("uuid"))
+    {
         return true;
     }
-    matches!(
-        lower.as_str(),
-        "timestamp"
-            | "starttime"
-            | "type"
-            | "role"
-            | "model"
-            | "version"
-            | "cwd"
-            | "gitbranch"
-            | "branch"
-            | "path"
-            | "file_path"
-            | "filepath"
-            | "producer"
-            | "name"
-            | "kind"
-            | "status"
-    )
+    key.eq_ignore_ascii_case("timestamp")
+        || key.eq_ignore_ascii_case("starttime")
+        || key.eq_ignore_ascii_case("type")
+        || key.eq_ignore_ascii_case("role")
+        || key.eq_ignore_ascii_case("model")
+        || key.eq_ignore_ascii_case("version")
+        || key.eq_ignore_ascii_case("cwd")
+        || key.eq_ignore_ascii_case("gitbranch")
+        || key.eq_ignore_ascii_case("branch")
+        || key.eq_ignore_ascii_case("path")
+        || key.eq_ignore_ascii_case("file_path")
+        || key.eq_ignore_ascii_case("filepath")
+        || key.eq_ignore_ascii_case("producer")
+        || key.eq_ignore_ascii_case("name")
+        || key.eq_ignore_ascii_case("kind")
+        || key.eq_ignore_ascii_case("status")
 }
 
 /// Recursively walk a JSON value, applying secret redaction to string leaves
