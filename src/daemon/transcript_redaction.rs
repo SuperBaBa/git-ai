@@ -7,7 +7,8 @@ fn is_denied_key(key: &str) -> bool {
         return true;
     }
     if key.eq_ignore_ascii_case("uuid")
-        || (key.len() > 4 && key[key.len() - 4..].eq_ignore_ascii_case("uuid"))
+        || (key.len() > 4
+            && key.as_bytes()[key.len() - 4..].eq_ignore_ascii_case(b"uuid"))
     {
         return true;
     }
