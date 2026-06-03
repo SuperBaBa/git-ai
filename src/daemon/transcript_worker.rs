@@ -735,9 +735,10 @@ impl TranscriptWorker {
                 .map(|ext_pid| generate_session_id(ext_pid, &stream.tool))
         };
 
-        // Resolve repo_work_dir with priority: task (hook) > DB > infer from transcript
+        // Resolve repo_work_dir with priority: task (hook) > DB > infer from transcript.
+        // Shared streams serve multiple repos so repo_url must not be set at the batch level.
         let resolved_work_dir = if is_shared_stream {
-            task.repo_work_dir.clone()
+            None
         } else {
             task.repo_work_dir
                 .clone()
