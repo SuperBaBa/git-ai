@@ -19,12 +19,13 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { spawn } from "child_process"
-import { existsSync, readFileSync, statSync } from "fs"
+import { readFileSync, statSync } from "fs"
 import { dirname, isAbsolute, join, resolve } from "path"
 
 // Absolute path to git-ai binary, replaced at install time by `git-ai install-hooks`
 const GIT_AI_BIN = "__GIT_AI_BINARY_PATH__"
 const CHECKPOINT_TIMEOUT_MS = 30_000
+const CHECKPOINT_ARGS = ["checkpoint", "opencode", "--hook-input", "stdin"]
 
 // Tools that modify files and should be tracked
 const FILE_EDIT_TOOLS = new Set([
@@ -187,21 +188,11 @@ const debugLog = (message: string, error?: unknown): void => {
   console.error(`[git-ai opencode] ${message}${detail ? `: ${detail}` : ""}`)
 }
 
-type CommandOptions = {
-  cwd?: string
-  input?: string
-  timeoutMs?: number
-}
-
-const runCommand = (
-  command: string,
-  args: string[],
-  options: CommandOptions = {},
-): Promise<{ stdout: string; stderr: string }> => {
+const runCheckpoint = (hookInput: string): Promise<void> => {
   return new Promise((resolve, reject) => {
     let settled = false
     let timeout: ReturnType<typeof setTimeout> | undefined
-    const finish = (error: Error | null, output?: { stdout: string; stderr: string }): void => {
+    const finish = (error: Error | null): void => {
       if (settled) {
         return
       }
@@ -212,55 +203,42 @@ const runCommand = (
       }
       if (error) {
         reject(error)
-      } else if (output) {
-        resolve(output)
+      } else {
+        resolve()
       }
     }
 
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
+    const child = spawn(GIT_AI_BIN, CHECKPOINT_ARGS, {
+      stdio: ["pipe", "ignore", "pipe"],
     })
 
-    const timeoutMs = options.timeoutMs ?? CHECKPOINT_TIMEOUT_MS
-    if (timeoutMs > 0) {
-      timeout = setTimeout(() => {
-        try {
-          child.kill("SIGTERM")
-        } catch (error) {
-          debugLog(`failed to kill timed-out command ${command}`, error)
-        }
-        finish(new Error(`${command} ${args.join(" ")} timed out after ${timeoutMs}ms`))
-      }, timeoutMs)
-    }
+    timeout = setTimeout(() => {
+      try {
+        child.kill("SIGTERM")
+      } catch (error) {
+        debugLog("failed to kill timed-out checkpoint command", error)
+      }
+      finish(new Error(`git-ai checkpoint opencode timed out after ${CHECKPOINT_TIMEOUT_MS}ms`))
+    }, CHECKPOINT_TIMEOUT_MS)
 
-    const stdout: Buffer[] = []
     const stderr: Buffer[] = []
 
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk))
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk))
     child.stdin.on("error", () => {
       // The child may exit before stdin is fully written; close/error handling below reports failures.
     })
     child.on("error", finish)
     child.on("close", (code) => {
-      const output = {
-        stdout: Buffer.concat(stdout).toString(),
-        stderr: Buffer.concat(stderr).toString(),
-      }
       if (code === 0) {
-        finish(null, output)
+        finish(null)
         return
       }
 
-      finish(new Error(`${command} ${args.join(" ")} exited with ${code}: ${output.stderr}`))
+      const stderrText = Buffer.concat(stderr).toString().trim()
+      finish(new Error(`git-ai checkpoint opencode exited with ${code}${stderrText ? `: ${stderrText}` : ""}`))
     })
 
-    if (options.input !== undefined) {
-      child.stdin.end(options.input)
-    } else {
-      child.stdin.end()
-    }
+    child.stdin.end(hookInput)
   })
 }
 
@@ -275,10 +253,8 @@ export const GitAiPlugin: Plugin = async (ctx) => {
     let candidate = pathHint
     while (candidate) {
       try {
-        if (existsSync(candidate)) {
-          const stat = statSync(candidate)
-          return stat.isDirectory() ? candidate : dirname(candidate)
-        }
+        const stat = statSync(candidate)
+        return stat.isDirectory() ? candidate : dirname(candidate)
       } catch (error) {
         debugLog(`failed to stat path while resolving git repo from ${candidate}`, error)
       }
@@ -308,7 +284,7 @@ export const GitAiPlugin: Plugin = async (ctx) => {
       const gitDirPath = isAbsolute(gitDir) || /^[a-zA-Z]:[\\/]/.test(gitDir)
         ? gitDir
         : resolve(worktreeDir, gitDir)
-      return existsSync(gitDirPath)
+      return statSync(gitDirPath).isDirectory()
     } catch (error) {
       debugLog(`failed to read gitdir pointer from ${gitFilePath}`, error)
       return false
@@ -318,10 +294,6 @@ export const GitAiPlugin: Plugin = async (ctx) => {
   const hasGitMetadata = (dir: string): boolean => {
     const marker = join(dir, ".git")
     try {
-      if (!existsSync(marker)) {
-        return false
-      }
-
       const stat = statSync(marker)
       if (stat.isDirectory()) {
         return true
@@ -449,54 +421,33 @@ export const GitAiPlugin: Plugin = async (ctx) => {
     "tool.execute.before": async (input: ToolHookInput, output?: { args?: unknown }) => {
       try {
         const toolName = hookString(input.tool)
+        const isTrackedEdit = isEditTool(toolName)
+        const isTrackedBash = isBashTool(toolName)
+        if (!isTrackedEdit && !isTrackedBash) {
+          return
+        }
+
         const callID = hookString(input.callID)
         const sessionID = hookString(input.sessionID)
         const toolInput = output?.args ?? input.args
         const toolCwd = resolveCwd(extractToolCwd(input.cwd ?? input.workdir, asRecord(toolInput)))
-
-        if (isEditTool(toolName)) {
-          const filePaths = extractFilePaths(toolInput, toolCwd)
-          const repoDir = resolveRepoDir(filePaths, toolCwd)
-          if (!repoDir) {
-            return
-          }
-
-          pendingCalls.set(callID, { repoDir, sessionID, toolInput })
-
-          const hookInput = JSON.stringify({
-            hook_event_name: "PreToolUse",
-            session_id: sessionID,
-            tool_use_id: callID,
-            cwd: repoDir,
-            tool_name: toolName,
-            tool_input: toolInput,
-          })
-          await runCommand(GIT_AI_BIN, ["checkpoint", "opencode", "--hook-input", "stdin"], {
-            input: hookInput,
-            timeoutMs: CHECKPOINT_TIMEOUT_MS,
-          })
-
-        } else if (isBashTool(toolName)) {
-          const repoDir = resolveRepoDir([], toolCwd)
-          if (!repoDir) {
-            return
-          }
-
-          pendingCalls.set(callID, { repoDir, sessionID, toolInput })
-
-          const hookInput = JSON.stringify({
-            hook_event_name: "PreToolUse",
-            session_id: sessionID,
-            tool_use_id: callID,
-            cwd: repoDir,
-            tool_name: toolName,
-            tool_input: toolInput,
-          })
-          await runCommand(GIT_AI_BIN, ["checkpoint", "opencode", "--hook-input", "stdin"], {
-            input: hookInput,
-            timeoutMs: CHECKPOINT_TIMEOUT_MS,
-          })
+        const filePaths = isTrackedEdit ? extractFilePaths(toolInput, toolCwd) : []
+        const repoDir = resolveRepoDir(filePaths, toolCwd)
+        if (!repoDir) {
+          return
         }
+
+        pendingCalls.set(callID, { repoDir, sessionID, toolInput })
+
+        const hookInput = JSON.stringify({
+          hook_event_name: "PreToolUse",
+          session_id: sessionID,
+          tool_use_id: callID,
+          cwd: repoDir,
+          tool_name: toolName,
+          tool_input: toolInput,
+        })
+        await runCheckpoint(hookInput)
       } catch (error) {
         debugLog("pre-tool checkpoint failed", error)
         // Checkpoint failures are non-critical — never propagate to the host
@@ -531,10 +482,7 @@ export const GitAiPlugin: Plugin = async (ctx) => {
           tool_name: toolName,
           tool_input: toolInput,
         })
-        await runCommand(GIT_AI_BIN, ["checkpoint", "opencode", "--hook-input", "stdin"], {
-          input: hookInput,
-          timeoutMs: CHECKPOINT_TIMEOUT_MS,
-        })
+        await runCheckpoint(hookInput)
       } catch (error) {
         debugLog("post-tool checkpoint failed", error)
         // Checkpoint failures are non-critical — never propagate to the host

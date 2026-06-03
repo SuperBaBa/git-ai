@@ -238,8 +238,8 @@ mod tests {
         // Placeholder should be replaced with the actual binary path in the const
         assert!(!content.contains("__GIT_AI_BINARY_PATH__"));
         assert!(content.contains(r#"const GIT_AI_BIN = "/usr/local/bin/git-ai""#));
-        // Commands reference the const through spawn(), which works in OpenCode CLI and Desktop.
-        assert!(content.contains("runCommand(GIT_AI_BIN"));
+        // Checkpoint execution uses spawn(), which works in OpenCode CLI and Desktop.
+        assert!(content.contains("spawn(GIT_AI_BIN"));
         assert!(content.contains(r#""checkpoint", "opencode", "--hook-input", "stdin""#));
         assert!(!content.contains("Bun.$"));
     }
