@@ -1,6 +1,7 @@
 use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
 use git_ai::git::refs::get_reference_as_authorship_log_v3;
+use git_ai::git::refs::notes_add;
 use git_ai::git::repository as GitAiRepository;
 
 fn direct_test_repo() -> TestRepo {
@@ -601,6 +602,7 @@ fn test_ci_rebase_merge_commit_order_pairing() {
         skip_fetch_notes: true,
         skip_fetch_base: true,
         skip_fetch_fork_notes: true,
+        skip_fetch_sync_refs: false,
         skip_push: false,
     });
     assert!(
@@ -1010,6 +1012,369 @@ fn test_ci_local_rebase_merge_three_commits() {
             .any(|f| f.contains("file_a") || f.contains("file_b")),
         "COMMIT ORDER BUG: rebased commit 3 references wrong file. Got: {:?}",
         files3
+    );
+}
+
+/// Verify that `git-ai ci local sync` preserves authorship when an open PR
+/// branch is rebased onto a newer base tip before it is merged. This matches the
+/// shape of GitHub's "Update branch -> Rebase" operation: the PR head is
+/// rewritten, but there is no merge commit yet.
+#[test]
+fn test_ci_local_open_pr_rebase_two_commits() {
+    use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
+
+    let repo = direct_test_repo();
+
+    // --- Initial commit on main ---
+    let mut base_file = repo.filename("base.txt");
+    base_file.set_contents(crate::lines!["base content"]);
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    repo.git(&["branch", "-M", "main"]).unwrap();
+
+    // --- Feature branch: two AI commits touching distinct files ---
+    repo.git_og(&["checkout", "-b", "feature"]).unwrap();
+
+    let mut file_a = repo.filename("file_a.txt");
+    file_a.set_contents(crate::lines!["ai content in file_a".ai()]);
+    let feature_sha1 = repo.stage_all_and_commit("Add file_a").unwrap().commit_sha;
+
+    let mut file_b = repo.filename("file_b.txt");
+    file_b.set_contents(crate::lines!["ai content in file_b".ai()]);
+    let feature_sha2 = repo.stage_all_and_commit("Add file_b").unwrap().commit_sha;
+
+    let previous_head_sha = feature_sha2.clone();
+
+    // --- Advance main so the open-PR rebase produces new SHAs ---
+    repo.git_og(&["checkout", "main"]).unwrap();
+    let mut main_file = repo.filename("main_only.txt");
+    main_file.set_contents(crate::lines!["main-only content"]);
+    repo.git_og(&["add", "main_only.txt"]).unwrap();
+    repo.git_og(&["commit", "-m", "Advance main"]).unwrap();
+    let base_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // --- Rebase the open feature branch onto main, bypassing local hooks ---
+    repo.git_og(&["checkout", "feature"]).unwrap();
+    repo.git_og(&["rebase", "main"]).unwrap();
+
+    let new_sha2 = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let new_sha1 = repo
+        .git_og(&["rev-parse", "HEAD~1"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    assert_ne!(
+        new_sha1, feature_sha1,
+        "open-PR rebase must produce a new SHA for commit 1"
+    );
+    assert_ne!(
+        new_sha2, feature_sha2,
+        "open-PR rebase must produce a new SHA for commit 2"
+    );
+    assert!(
+        repo.read_authorship_note(&new_sha1).is_none(),
+        "bypassed rebase should not pre-create note for commit 1"
+    );
+    assert!(
+        repo.read_authorship_note(&new_sha2).is_none(),
+        "bypassed rebase should not pre-create note for commit 2"
+    );
+
+    // --- Run the new open-PR sync command ---
+    let output = repo
+        .git_ai(&[
+            "ci",
+            "local",
+            "sync",
+            "--previous-head-sha",
+            previous_head_sha.as_str(),
+            "--base-ref",
+            "main",
+            "--base-sha",
+            base_sha.as_str(),
+            "--head-sha",
+            new_sha2.as_str(),
+            "--skip-fetch-notes",
+            "--skip-push",
+        ])
+        .expect("ci local sync should succeed");
+
+    assert!(
+        output.contains("Local CI (sync): authorship rewritten successfully"),
+        "Expected authorship rewritten, got: {}",
+        output
+    );
+
+    // --- Verify each rebased open-PR commit carries notes for its own file ---
+    let note1 = repo
+        .read_authorship_note(&new_sha1)
+        .expect("rebased PR commit 1 should have an authorship note");
+    let note2 = repo
+        .read_authorship_note(&new_sha2)
+        .expect("rebased PR commit 2 should have an authorship note");
+
+    let files1: Vec<String> = AuthorshipLog::deserialize_from_string(&note1)
+        .unwrap()
+        .attestations
+        .iter()
+        .map(|a| a.file_path.clone())
+        .collect();
+    let files2: Vec<String> = AuthorshipLog::deserialize_from_string(&note2)
+        .unwrap()
+        .attestations
+        .iter()
+        .map(|a| a.file_path.clone())
+        .collect();
+
+    assert!(
+        files1.iter().any(|f| f.contains("file_a")),
+        "rebased PR commit 1 should reference file_a.txt, got: {:?}",
+        files1
+    );
+    assert!(
+        !files1.iter().any(|f| f.contains("file_b")),
+        "rebased PR commit 1 should not reference file_b.txt, got: {:?}",
+        files1
+    );
+    assert!(
+        files2.iter().any(|f| f.contains("file_b")),
+        "rebased PR commit 2 should reference file_b.txt, got: {:?}",
+        files2
+    );
+    assert!(
+        !files2.iter().any(|f| f.contains("file_a")),
+        "rebased PR commit 2 should not reference file_a.txt, got: {:?}",
+        files2
+    );
+}
+
+/// Verify that `git-ai ci local sync` handles GitHub's conflict-free
+/// Update-branch-with-rebase shape for a single-commit PR. A single commit is
+/// the easiest case to accidentally treat as a fast-forward/no-op or to mishandle
+/// when computing merge bases.
+#[test]
+fn test_ci_local_open_pr_rebase_single_commit() {
+    use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
+
+    let repo = direct_test_repo();
+
+    let mut base_file = repo.filename("base.txt");
+    base_file.set_contents(crate::lines!["base content"]);
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    repo.git(&["branch", "-M", "main"]).unwrap();
+
+    repo.git_og(&["checkout", "-b", "feature"]).unwrap();
+    let mut feature_file = repo.filename("feature.txt");
+    feature_file.set_contents(crate::lines!["ai content".ai()]);
+    let previous_head_sha = repo.stage_all_and_commit("Add feature").unwrap().commit_sha;
+
+    repo.git_og(&["checkout", "main"]).unwrap();
+    let mut main_file = repo.filename("main_only.txt");
+    main_file.set_contents(crate::lines!["main-only content"]);
+    repo.git_og(&["add", "main_only.txt"]).unwrap();
+    repo.git_og(&["commit", "-m", "Advance main"]).unwrap();
+    let base_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    repo.git_og(&["checkout", "feature"]).unwrap();
+    repo.git_og(&["rebase", "main"]).unwrap();
+    let current_head_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    assert_ne!(current_head_sha, previous_head_sha);
+    assert!(
+        repo.read_authorship_note(&current_head_sha).is_none(),
+        "bypassed rebase should not pre-create note for the rebased commit"
+    );
+
+    let output = repo
+        .git_ai(&[
+            "ci",
+            "local",
+            "sync",
+            "--previous-head-sha",
+            previous_head_sha.as_str(),
+            "--base-ref",
+            "main",
+            "--base-sha",
+            base_sha.as_str(),
+            "--head-sha",
+            current_head_sha.as_str(),
+            "--skip-fetch-notes",
+            "--skip-push",
+        ])
+        .expect("ci local sync should succeed");
+
+    assert!(
+        output.contains("Local CI (sync): authorship rewritten successfully"),
+        "Expected authorship rewritten, got: {}",
+        output
+    );
+
+    let note = repo
+        .read_authorship_note(&current_head_sha)
+        .expect("rebased single PR commit should have an authorship note");
+    let files: Vec<String> = AuthorshipLog::deserialize_from_string(&note)
+        .unwrap()
+        .attestations
+        .iter()
+        .map(|a| a.file_path.clone())
+        .collect();
+    assert!(
+        files.iter().any(|f| f.contains("feature.txt")),
+        "rebased single PR commit should reference feature.txt, got: {:?}",
+        files
+    );
+}
+
+/// If the client-side git-ai CLI already handled the local rebase and pushed or
+/// materialized notes for the new PR commits, CI must not regenerate those notes.
+/// This is the conservative safety boundary for all PR synchronize events.
+#[test]
+fn test_ci_local_sync_skips_when_current_rebased_commit_already_has_note() {
+    let repo = direct_test_repo();
+
+    let mut base_file = repo.filename("base.txt");
+    base_file.set_contents(crate::lines!["base content"]);
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    repo.git(&["branch", "-M", "main"]).unwrap();
+
+    repo.git_og(&["checkout", "-b", "feature"]).unwrap();
+    let mut feature_file = repo.filename("feature.txt");
+    feature_file.set_contents(crate::lines!["ai content".ai()]);
+    let previous_head_sha = repo.stage_all_and_commit("Add feature").unwrap().commit_sha;
+
+    repo.git_og(&["checkout", "main"]).unwrap();
+    let mut main_file = repo.filename("main_only.txt");
+    main_file.set_contents(crate::lines!["main-only content"]);
+    repo.git_og(&["add", "main_only.txt"]).unwrap();
+    repo.git_og(&["commit", "-m", "Advance main"]).unwrap();
+    let base_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    repo.git_og(&["checkout", "feature"]).unwrap();
+    repo.git_og(&["rebase", "main"]).unwrap();
+    let current_head_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let gitai_repo =
+        GitAiRepository::find_repository_in_path(repo.path().to_str().expect("repo path"))
+            .expect("git-ai repo");
+    let existing_note = "client-side-note-that-ci-must-not-overwrite";
+    notes_add(&gitai_repo, &current_head_sha, existing_note).expect("add existing current note");
+
+    let output = repo
+        .git_ai(&[
+            "ci",
+            "local",
+            "sync",
+            "--previous-head-sha",
+            previous_head_sha.as_str(),
+            "--base-ref",
+            "main",
+            "--base-sha",
+            base_sha.as_str(),
+            "--head-sha",
+            current_head_sha.as_str(),
+            "--skip-fetch-notes",
+            "--skip-push",
+        ])
+        .expect("ci local sync should succeed");
+
+    assert!(
+        output.contains("Local CI (sync): skipped PR sync with existing current notes"),
+        "Expected existing-note skip, got: {}",
+        output
+    );
+    let current_note = repo
+        .read_authorship_note(&current_head_sha)
+        .map(|note| note.trim().to_string());
+    assert_eq!(
+        current_note.as_deref(),
+        Some(existing_note),
+        "CI sync must not overwrite a current commit note that already exists"
+    );
+}
+
+/// Verify that `git-ai ci local sync` can run for every PR synchronize event
+/// without treating arbitrary non-fast-forward updates as rebases.
+#[test]
+fn test_ci_local_sync_skips_non_rebase_force_push() {
+    let repo = direct_test_repo();
+
+    let mut base_file = repo.filename("base.txt");
+    base_file.set_contents(crate::lines!["base content"]);
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    repo.git(&["branch", "-M", "main"]).unwrap();
+
+    repo.git_og(&["checkout", "-b", "feature"]).unwrap();
+    let mut feature_file = repo.filename("feature.txt");
+    feature_file.set_contents(crate::lines!["old ai content".ai()]);
+    let previous_head_sha = repo
+        .stage_all_and_commit("Add old AI content")
+        .unwrap()
+        .commit_sha;
+    assert!(
+        repo.read_authorship_note(&previous_head_sha).is_some(),
+        "old PR head should have an authorship note"
+    );
+
+    repo.git_og(&["reset", "--hard", "main"]).unwrap();
+    feature_file.set_contents(crate::lines!["different force-pushed content"]);
+    repo.git_og(&["add", "feature.txt"]).unwrap();
+    repo.git_og(&["commit", "-m", "Force-pushed replacement"])
+        .unwrap();
+    let current_head_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let output = repo
+        .git_ai(&[
+            "ci",
+            "local",
+            "sync",
+            "--previous-head-sha",
+            previous_head_sha.as_str(),
+            "--base-ref",
+            "main",
+            "--head-sha",
+            current_head_sha.as_str(),
+            "--skip-fetch-notes",
+            "--skip-fetch-sync-refs",
+            "--skip-push",
+        ])
+        .expect("ci local sync should succeed for non-rebase force push");
+
+    assert!(
+        output.contains("Local CI (sync): skipped non-rebase PR sync"),
+        "Expected non-rebase sync skip, got: {}",
+        output
+    );
+    assert!(
+        repo.read_authorship_note(&current_head_sha).is_none(),
+        "non-rebase sync must not transfer old authorship to unrelated replacement commit"
     );
 }
 
@@ -1440,6 +1805,7 @@ fn test_ci_squash_merge_not_misclassified_as_rebase_on_linear_main() {
         skip_fetch_notes: true,
         skip_fetch_base: true,
         skip_fetch_fork_notes: true,
+        skip_fetch_sync_refs: false,
         skip_push: true,
     })
     .expect("CI merge rewrite should succeed");
