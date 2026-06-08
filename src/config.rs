@@ -115,9 +115,11 @@ pub struct Config {
     #[serde(serialize_with = "serialize_masked_api_key")]
     api_key: Option<String>,
     quiet: bool,
+    allow_superuser: bool,
     custom_attributes: HashMap<String, String>,
     git_ai_hooks: HashMap<String, Vec<String>>,
     notes_backend: NotesBackendConfig,
+    transcript_streaming_lookback_days: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize)]
@@ -186,11 +188,15 @@ pub struct FileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_superuser: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_attributes: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_ai_hooks: Option<HashMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_backend: Option<NotesBackendConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_streaming_lookback_days: Option<u32>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -219,6 +225,8 @@ pub struct ConfigPatch {
     pub feature_flags: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_backend: Option<NotesBackendConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_streaming_lookback_days: Option<u32>,
 }
 
 impl Config {
@@ -271,11 +279,10 @@ impl Config {
             && let Some(remotes) = remotes
         {
             // If any remote matches the exclusion patterns, deny access
-            if remotes.iter().any(|remote| {
-                self.exclude_repositories
-                    .iter()
-                    .any(|pattern| pattern.matches(&remote.1))
-            }) {
+            if remotes
+                .iter()
+                .any(|remote| remote_matches_patterns(&self.exclude_repositories, &remote.1))
+            {
                 return false;
             }
         }
@@ -287,11 +294,9 @@ impl Config {
 
         // If allowlist is defined, only allow repos whose remotes match the patterns
         match remotes {
-            Some(remotes) => remotes.iter().any(|remote| {
-                self.allow_repositories
-                    .iter()
-                    .any(|pattern| pattern.matches(&remote.1))
-            }),
+            Some(remotes) => remotes
+                .iter()
+                .any(|remote| remote_matches_patterns(&self.allow_repositories, &remote.1)),
             None => false, // Can't verify, deny by default when allowlist is active
         }
     }
@@ -327,9 +332,7 @@ impl Config {
                 } else {
                     // Has remotes - check if any match exclusion patterns
                     remotes.iter().any(|remote| {
-                        self.exclude_prompts_in_repositories
-                            .iter()
-                            .any(|pattern| pattern.matches(&remote.1))
+                        remote_matches_patterns(&self.exclude_prompts_in_repositories, &remote.1)
                     })
                 }
             }
@@ -412,9 +415,7 @@ impl Config {
             Some(remotes) if !remotes.is_empty() => {
                 // Has remotes - check if any match inclusion patterns
                 remotes.iter().any(|remote| {
-                    self.include_prompts_in_repositories
-                        .iter()
-                        .any(|pattern| pattern.matches(&remote.1))
+                    remote_matches_patterns(&self.include_prompts_in_repositories, &remote.1)
                 })
             }
             _ => {
@@ -467,9 +468,17 @@ impl Config {
         matches!(self.notes_backend.kind, NotesBackendKind::Http)
     }
 
+    pub fn transcript_streaming_lookback_days(&self) -> Option<u32> {
+        self.transcript_streaming_lookback_days
+    }
+
     /// Returns true if quiet mode is enabled (suppresses chart output after commits)
     pub fn is_quiet(&self) -> bool {
         self.quiet
+    }
+
+    pub fn allow_superuser(&self) -> bool {
+        self.allow_superuser
     }
 
     /// Returns the custom attributes map (from config file + env var override).
@@ -543,6 +552,154 @@ where
 {
     let as_strings: Vec<&str> = patterns.iter().map(Pattern::as_str).collect();
     as_strings.serialize(serializer)
+}
+
+fn remote_matches_patterns(patterns: &[Pattern], remote_url: &str) -> bool {
+    let remote_candidates = repo_remote_match_candidates(remote_url);
+    patterns.iter().any(|pattern| {
+        repo_pattern_match_candidates(pattern.as_str())
+            .iter()
+            .filter_map(|candidate| Pattern::new(candidate).ok())
+            .any(|candidate_pattern| {
+                remote_candidates
+                    .iter()
+                    .any(|candidate| candidate_pattern.matches(candidate))
+            })
+    })
+}
+
+fn repo_pattern_match_candidates(value: &str) -> Vec<String> {
+    let mut candidates = vec![value.trim().to_string()];
+
+    if let Some((host, path_variants)) = repo_match_parts(value) {
+        for path in path_variants {
+            candidates.push(format!("{}/{}", host, path));
+        }
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn repo_remote_match_candidates(value: &str) -> Vec<String> {
+    let mut candidates = vec![value.trim().to_string()];
+
+    if let Some((host, path_variants)) = repo_match_parts(value) {
+        for path in path_variants {
+            candidates.push(format!("{}/{}", host, path));
+            candidates.push(path);
+        }
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn repo_match_parts(value: &str) -> Option<(String, Vec<String>)> {
+    let value = value.trim();
+
+    if let Some((_, rest)) = value.split_once("://") {
+        let (authority, path) = rest.split_once('/')?;
+        return Some((
+            normalize_repo_authority(authority)?,
+            normalize_repo_path_variants(path)?,
+        ));
+    }
+
+    let (user_host, path) = value.split_once(':')?;
+    if value.starts_with('/') || !user_host.contains('@') || path.is_empty() {
+        return None;
+    }
+
+    let (_, host) = user_host.rsplit_once('@')?;
+    Some((
+        normalize_repo_host(host)?,
+        normalize_repo_path_variants(path)?,
+    ))
+}
+
+fn normalize_repo_authority(authority: &str) -> Option<String> {
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    normalize_repo_host(host)
+}
+
+fn normalize_repo_host(host: &str) -> Option<String> {
+    let host = strip_repo_host_port(host.trim());
+    if host.is_empty() {
+        return None;
+    }
+
+    let host = host.to_ascii_lowercase();
+    if matches!(host.as_str(), "dev.azure.com" | "ssh.dev.azure.com") {
+        Some("azure".to_string())
+    } else {
+        Some(host)
+    }
+}
+
+fn strip_repo_host_port(host: &str) -> &str {
+    if let Some(stripped) = strip_bracketed_host_port(host) {
+        return stripped;
+    }
+
+    let Some((host_without_port, port)) = host.rsplit_once(':') else {
+        return host;
+    };
+    if host_without_port.contains(':') || port.is_empty() {
+        host
+    } else {
+        host_without_port
+    }
+}
+
+fn strip_bracketed_host_port(host: &str) -> Option<&str> {
+    let rest = host.strip_prefix('[')?;
+    let bracket_index = rest.find(']')?;
+    let bracket_end = bracket_index + 2;
+    let after_bracket = host.get(bracket_end..)?;
+
+    if after_bracket.is_empty() || after_bracket.starts_with(':') {
+        Some(&host[..bracket_end])
+    } else {
+        None
+    }
+}
+
+fn normalize_repo_path_variants(path: &str) -> Option<Vec<String>> {
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(path)
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+
+    if path.is_empty() {
+        return None;
+    }
+
+    let mut variants = vec![path.to_string()];
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.first() == Some(&"v3") && segments.len() > 1 {
+        variants.push(segments[1..].join("/"));
+    }
+    if let Some(git_segment_index) = segments.iter().position(|segment| *segment == "_git")
+        && git_segment_index > 0
+        && git_segment_index + 1 < segments.len()
+    {
+        let mut without_git_segment = segments.clone();
+        without_git_segment.remove(git_segment_index);
+        variants.push(without_git_segment.join("/"));
+    }
+
+    variants.sort();
+    variants.dedup();
+    Some(variants)
 }
 
 fn serialize_masked_api_key<S>(api_key: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
@@ -716,6 +873,11 @@ fn build_config() -> Config {
     // Get quiet setting (defaults to false)
     let quiet = file_cfg.as_ref().and_then(|c| c.quiet).unwrap_or(false);
 
+    let allow_superuser = file_cfg
+        .as_ref()
+        .and_then(|c| c.allow_superuser)
+        .unwrap_or(false);
+
     // Build custom attributes: file config as base, env var overrides
     let custom_attributes = build_custom_attributes(&file_cfg);
 
@@ -762,6 +924,18 @@ fn build_config() -> Config {
             .or_else(|| file_backend.as_ref().and_then(|b| b.backend_url.clone())),
     };
 
+    // Transcript streaming lookback: env > file > default (7 days). 0 means unlimited (None).
+    let transcript_streaming_lookback_days = env::var("GIT_AI_TRANSCRIPT_STREAMING_LOOKBACK_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .or_else(|| {
+            file_cfg
+                .as_ref()
+                .and_then(|c| c.transcript_streaming_lookback_days)
+        })
+        .or(Some(7))
+        .and_then(|v| if v == 0 { None } else { Some(v) });
+
     #[cfg(any(test, feature = "test-support"))]
     {
         let mut config = Config {
@@ -781,9 +955,11 @@ fn build_config() -> Config {
             default_prompt_storage,
             api_key,
             quiet,
+            allow_superuser,
             custom_attributes: custom_attributes.clone(),
             git_ai_hooks: git_ai_hooks.clone(),
             notes_backend,
+            transcript_streaming_lookback_days,
         };
         apply_test_config_patch(&mut config);
         config
@@ -807,9 +983,11 @@ fn build_config() -> Config {
         default_prompt_storage,
         api_key,
         quiet,
+        allow_superuser,
         custom_attributes,
         git_ai_hooks,
         notes_backend,
+        transcript_streaming_lookback_days,
     }
 }
 
@@ -1240,6 +1418,9 @@ fn apply_test_config_patch(config: &mut Config) {
                 config.notes_backend.backend_url = Some(url);
             }
         }
+        if let Some(days) = patch.transcript_streaming_lookback_days {
+            config.transcript_streaming_lookback_days = if days == 0 { None } else { Some(days) };
+        }
     }
 }
 
@@ -1274,9 +1455,11 @@ mod tests {
             default_prompt_storage: None,
             api_key: None,
             quiet: false,
+            allow_superuser: false,
             custom_attributes: HashMap::new(),
             git_ai_hooks: HashMap::new(),
             notes_backend: NotesBackendConfig::default(),
+            transcript_streaming_lookback_days: Some(7),
         }
     }
 
@@ -1361,6 +1544,96 @@ mod tests {
         assert!(!config.allow_repositories[0].matches("git@github.com:other/repo"));
     }
 
+    #[test]
+    fn test_remote_pattern_matching_normalizes_common_git_url_forms() {
+        let scp_patterns = vec![Pattern::new("git@github.com:company/*").unwrap()];
+        assert!(remote_matches_patterns(
+            &scp_patterns,
+            "ssh://git@github.com/company/repo"
+        ));
+        assert!(remote_matches_patterns(
+            &scp_patterns,
+            "ssh://git@github.com:22/company/repo"
+        ));
+        assert!(!remote_matches_patterns(
+            &scp_patterns,
+            "ssh://git@github.com/other/repo"
+        ));
+        assert!(remote_matches_patterns(
+            &scp_patterns,
+            "https://github.com/company/repo"
+        ));
+        assert!(remote_matches_patterns(
+            &scp_patterns,
+            "git://github.com/company/repo.git"
+        ));
+
+        let ssh_patterns = vec![Pattern::new("ssh://git@github.com/company/*").unwrap()];
+        assert!(remote_matches_patterns(
+            &ssh_patterns,
+            "git@github.com:company/repo"
+        ));
+        assert!(remote_matches_patterns(
+            &ssh_patterns,
+            "https://github.com/company/repo.git"
+        ));
+
+        let ssh_port_patterns = vec![Pattern::new("ssh://git@github.com:2222/company/*").unwrap()];
+        assert!(remote_matches_patterns(
+            &ssh_port_patterns,
+            "git@github.com:company/repo"
+        ));
+        assert!(remote_matches_patterns(
+            &ssh_port_patterns,
+            "ssh://git@github.com:2022/company/repo"
+        ));
+
+        let https_patterns = vec![Pattern::new("https://github.com/company/*").unwrap()];
+        assert!(remote_matches_patterns(
+            &https_patterns,
+            "ssh://git@github.com:2022/company/repo"
+        ));
+        assert!(remote_matches_patterns(
+            &https_patterns,
+            "git@github.com:company/repo.git"
+        ));
+    }
+
+    #[test]
+    fn test_remote_pattern_matching_allows_hostless_repository_patterns() {
+        let patterns = vec![Pattern::new("company/*").unwrap()];
+
+        assert!(remote_matches_patterns(
+            &patterns,
+            "https://github.com/company/repo"
+        ));
+        assert!(remote_matches_patterns(
+            &patterns,
+            "git@gitlab.com:company/repo.git"
+        ));
+        assert!(!remote_matches_patterns(
+            &patterns,
+            "https://github.com/other/repo"
+        ));
+    }
+
+    #[test]
+    fn test_remote_pattern_matching_handles_azure_https_and_ssh_shape_difference() {
+        let https_patterns =
+            vec![Pattern::new("https://dev.azure.com/acme/widgets/_git/*").unwrap()];
+        assert!(remote_matches_patterns(
+            &https_patterns,
+            "ssh://git@ssh.dev.azure.com:22/v3/acme/widgets/service"
+        ));
+
+        let ssh_patterns =
+            vec![Pattern::new("ssh://git@ssh.dev.azure.com/v3/acme/widgets/*").unwrap()];
+        assert!(remote_matches_patterns(
+            &ssh_patterns,
+            "https://dev.azure.com/acme/widgets/_git/service"
+        ));
+    }
+
     // Tests for exclude_prompts_in_repositories (blacklist)
 
     fn create_test_config_with_exclude_prompts(exclude_prompts_patterns: Vec<String>) -> Config {
@@ -1384,9 +1657,11 @@ mod tests {
             default_prompt_storage: None,
             api_key: None,
             quiet: false,
+            allow_superuser: false,
             custom_attributes: HashMap::new(),
             git_ai_hooks: HashMap::new(),
             notes_backend: NotesBackendConfig::default(),
+            transcript_streaming_lookback_days: Some(7),
         }
     }
 
@@ -1472,6 +1747,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_exclude_prompt_patterns_match_ssh_equivalent_remotes() {
+        let config =
+            create_test_config_with_exclude_prompts(vec!["git@github.com:private/*".to_string()]);
+
+        assert!(remote_matches_patterns(
+            &config.exclude_prompts_in_repositories,
+            "ssh://git@github.com/private/repo"
+        ));
+    }
+
     // Tests for effective_prompt_storage() with include_prompts_in_repositories
 
     fn create_test_config_with_include_prompts(
@@ -1503,9 +1789,11 @@ mod tests {
             default_prompt_storage: default_prompt_storage.map(|s| s.to_string()),
             api_key: None,
             quiet: false,
+            allow_superuser: false,
             custom_attributes: HashMap::new(),
             git_ai_hooks: HashMap::new(),
             notes_backend: NotesBackendConfig::default(),
+            transcript_streaming_lookback_days: Some(7),
         }
     }
 
@@ -1616,6 +1904,21 @@ mod tests {
         assert!(
             !config.include_prompts_in_repositories[0].matches("https://github.com/other-org/repo")
         );
+    }
+
+    #[test]
+    fn test_include_prompt_patterns_match_ssh_equivalent_remotes() {
+        let config = create_test_config_with_include_prompts(
+            vec!["ssh://git@github.com/positron-ai/*".to_string()],
+            vec![],
+            "default",
+            Some("notes"),
+        );
+
+        assert!(remote_matches_patterns(
+            &config.include_prompts_in_repositories,
+            "git@github.com:positron-ai/repo"
+        ));
     }
 
     #[test]
@@ -1734,6 +2037,16 @@ mod tests {
     }
 
     #[test]
+    fn test_allowlist_matches_ssh_url_remote_with_scp_pattern() {
+        let config = create_test_config(vec!["git@github.com:myorg/*".to_string()], vec![]);
+        let remotes = vec![(
+            "origin".to_string(),
+            "ssh://git@github.com/myorg/project".to_string(),
+        )];
+        assert!(config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
     fn test_allowlist_denies_unmatched_remotes() {
         let config = create_test_config(vec!["https://github.com/myorg/*".to_string()], vec![]);
         let remotes = vec![(
@@ -1752,6 +2065,17 @@ mod tests {
         let remotes = vec![(
             "origin".to_string(),
             "https://github.com/myorg/secret".to_string(),
+        )];
+        assert!(!config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_exclusion_matches_scp_remote_with_ssh_url_pattern() {
+        let config =
+            create_test_config(vec![], vec!["ssh://git@github.com/excluded/*".to_string()]);
+        let remotes = vec![(
+            "origin".to_string(),
+            "git@github.com:excluded/repo".to_string(),
         )];
         assert!(!config.is_allowed_repository_with_remotes(Some(&remotes)));
     }
@@ -1960,5 +2284,39 @@ mod tests {
             NotesBackendKind::Http,
             "GIT_AI_NOTES_BACKEND_KIND=http should override the default git_notes"
         );
+    }
+
+    #[test]
+    fn test_transcript_streaming_lookback_days_default() {
+        let config = create_test_config(vec![], vec![]);
+        assert_eq!(config.transcript_streaming_lookback_days(), Some(7));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_transcript_streaming_lookback_days_env_override() {
+        let previous = std::env::var("GIT_AI_TRANSCRIPT_STREAMING_LOOKBACK_DAYS").ok();
+        unsafe { std::env::set_var("GIT_AI_TRANSCRIPT_STREAMING_LOOKBACK_DAYS", "14") };
+        let config = build_config();
+        let result = config.transcript_streaming_lookback_days;
+        match previous {
+            Some(v) => unsafe { std::env::set_var("GIT_AI_TRANSCRIPT_STREAMING_LOOKBACK_DAYS", v) },
+            None => unsafe { std::env::remove_var("GIT_AI_TRANSCRIPT_STREAMING_LOOKBACK_DAYS") },
+        }
+        assert_eq!(result, Some(14));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_transcript_streaming_lookback_days_zero_means_unlimited() {
+        let previous = std::env::var("GIT_AI_TRANSCRIPT_STREAMING_LOOKBACK_DAYS").ok();
+        unsafe { std::env::set_var("GIT_AI_TRANSCRIPT_STREAMING_LOOKBACK_DAYS", "0") };
+        let config = build_config();
+        let result = config.transcript_streaming_lookback_days;
+        match previous {
+            Some(v) => unsafe { std::env::set_var("GIT_AI_TRANSCRIPT_STREAMING_LOOKBACK_DAYS", v) },
+            None => unsafe { std::env::remove_var("GIT_AI_TRANSCRIPT_STREAMING_LOOKBACK_DAYS") },
+        }
+        assert_eq!(result, None);
     }
 }
